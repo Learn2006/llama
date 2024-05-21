@@ -15,6 +15,7 @@ from fairscale.nn.model_parallel.layers import (
 )
 from torch import nn
 
+torch.set_printoptions(profile="full")
 
 @dataclass
 class ModelArgs:
@@ -29,6 +30,7 @@ class ModelArgs:
 
     max_batch_size: int = 32
     max_seq_len: int = 2048
+    sparsity: float = 0.5
 
 
 class RMSNorm(torch.nn.Module):
@@ -303,6 +305,180 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
+class SparseAttention(nn.Module):
+    """Multi-head sparse attention module."""
+    def __init__(self, args: ModelArgs):
+        """
+        Initialize the SparseAttention module.
+
+        Args:
+            args (ModelArgs): Model configuration parameters.
+
+        Attributes:
+            n_kv_heads (int): Number of key and value heads.
+            n_local_heads (int): Number of local query heads.
+            n_local_kv_heads (int): Number of local key and value heads.
+            n_rep (int): Number of repetitions for local heads.
+            head_dim (int): Dimension size of each attention head.
+            wq (ColumnParallelLinear): Linear transformation for queries.
+            wk (ColumnParallelLinear): Linear transformation for keys.
+            wv (ColumnParallelLinear): Linear transformation for values.
+            wo (RowParallelLinear): Linear transformation for output.
+            cache_k (torch.Tensor): Cached keys for attention.
+            cache_v (torch.Tensor): Cached values for attention.
+            sparsity (torch.float): the sparsity of kv cache, 0.9 means 10% kv cache is kept
+
+        """
+        super().__init__()
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        model_parallel_size = fs_init.get_model_parallel_world_size()
+        self.n_local_heads = args.n_heads // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.dim // args.n_heads
+        self.sparsity = args.sparsity
+        
+        self.cpu_tokens = [[] for b in range(args.max_batch_size)] # move the kv cache to CPU, so they should be zeros
+        self.n_local_kv_token = 0
+        self.n_global_kv_token = 0
+        self.attention_score_cache = torch.zeros(
+            (
+                args.max_batch_size,
+                int(args.max_seq_len * (1 - self.sparsity)),
+                args.max_seq_len,
+            )
+        ).cuda()
+
+        self.wq = ColumnParallelLinear(
+            args.dim,
+            args.n_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.wk = ColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.wv = ColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.wo = RowParallelLinear(
+            args.n_heads * self.head_dim,
+            args.dim,
+            bias=False,
+            input_is_parallel=True,
+            init_method=lambda x: x,
+        )
+
+        self.cache_k = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+        self.cache_v = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ):
+        """
+        Forward pass of the sparse attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            start_pos (int): Starting position for caching.
+            freqs_cis (torch.Tensor): Precomputed frequency tensor.
+            mask (torch.Tensor, optional): Attention mask tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after attention.
+
+        """
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        self.cache_k = self.cache_k.to(xq)
+        self.cache_v = self.cache_v.to(xq)
+
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+
+        keys = self.cache_k[:bsz, : start_pos + seqlen]
+        values = self.cache_v[:bsz, : start_pos + seqlen]
+        
+        print(f"the original kv cache:\n {keys}\n, v cache:\n {values}")
+        
+        # mask the cpu tokens
+        for b in range(bsz):
+            keys[b, self.cpu_tokens[b]] = 0
+            values[b, self.cpu_tokens[b]] = 0
+        
+        print(f"the selected k cache:\n {keys}\n, v cache:\n {values}")
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        
+        print(f"the corresponding scores:\n {scores}")
+        
+        n_selected_tokens = int((start_pos + seqlen) * (1 - self.sparsity))
+        n_local_tokens    = n_selected_tokens // 2
+        n_global_tokens   = n_selected_tokens - n_local_tokens
+        
+        # update the attention scores
+        self.attention_score_cache[: bsz, : n_local_tokens, : start_pos + seqlen] = torch.cat(
+            (self.attention_score_cache[: bsz, : self.n_local_kv_token, : start_pos + seqlen], torch.sum(scores, dim=1)), dim=1 # reduce scores on multi-head attention
+        )[: bsz, : n_local_tokens, : start_pos + seqlen]
+        self.n_local_kv_token = n_local_tokens
+        self.n_global_kv_token = n_global_tokens
+        
+        print(f"the attention score cache:\n {self.attention_score_cache[: bsz, : n_local_tokens, : start_pos + seqlen]}")
+        
+        # select the important tokens
+        attention_sum = torch.sum(self.attention_score_cache[: bsz, : n_local_tokens, : start_pos + seqlen - n_local_tokens], dim=1) # reduce on sequence dimension
+        
+        self.cpu_tokens = torch.topk(attention_sum, start_pos + seqlen - n_selected_tokens, dim=-1, largest=False).indices.tolist()
+        
+        print(f"the cpu tokens:\n {self.cpu_tokens}")
+        
+        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.wo(output)
 
 class FeedForward(nn.Module):
     def __init__(
@@ -372,7 +548,14 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
+        # if args.sparsity == 0: # 稀疏度为0，保留所有的kv cache，采用传统的Attention
+        #     print("normal attention is adopt")
+        #     self.attention = Attention(args)
+        # else:
+        #     print("sparse attention is adopt")
+        #     self.attention = SparseAttention(args)
+        self.attention = SparseAttention(args)
+        # self.attention = Attention(args)vb    
         self.feed_forward = FeedForward(
             dim=args.dim,
             hidden_dim=4 * args.dim,
@@ -403,6 +586,7 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
+        print(f"layer id: {self.layer_id}")
         h = x + self.attention(
             self.attention_norm(x), start_pos, freqs_cis, mask
         )

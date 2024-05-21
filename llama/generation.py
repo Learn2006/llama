@@ -55,6 +55,7 @@ class Llama:
         tokenizer_path: str,
         max_seq_len: int,
         max_batch_size: int,
+        sparsity: float,
         model_parallel_size: Optional[int] = None,
         seed: int = 1,
     ) -> "Llama":
@@ -111,6 +112,7 @@ class Llama:
         model_args: ModelArgs = ModelArgs(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
+            sparsity=sparsity,
             **params,
         )
         tokenizer = Tokenizer(model_path=tokenizer_path)
