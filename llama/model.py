@@ -2,6 +2,7 @@
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -15,7 +16,7 @@ from fairscale.nn.model_parallel.layers import (
 )
 from torch import nn
 
-torch.set_printoptions(profile="full")
+torch.set_printoptions(profile="full", linewidth=2000)
 
 @dataclass
 class ModelArgs:
@@ -339,8 +340,8 @@ class SparseAttention(nn.Module):
         self.sparsity = args.sparsity
         
         self.cpu_tokens = [[] for b in range(args.max_batch_size)] # move the kv cache to CPU, so they should be zeros
-        self.n_local_kv_token = 0
-        self.n_global_kv_token = 0
+        self.n_local_kv_tokens = 0
+        self.n_global_kv_tokens = 0
         self.attention_score_cache = torch.zeros(
             (
                 args.max_batch_size,
@@ -433,14 +434,23 @@ class SparseAttention(nn.Module):
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
         
-        print(f"the original kv cache:\n {keys}\n, v cache:\n {values}")
+        debug_mode = os.getenv('DEBUG', 'false').lower() == 'true'
+        if debug_mode:
+            print(f"start pos: {start_pos}, seqlen: {seqlen}")
+            print(f"the current q:\n {xq[:, :, 0]}\n, k:\n {xk[:, :, 0]}\n, v:\n {xv[:, :, 0]}")
+        
+        if debug_mode:
+            print(f"the original kv cache:\n {keys[:, :, 0]}\n, v cache:\n {values[:, :, 0]}")
         
         # mask the cpu tokens
         for b in range(bsz):
             keys[b, self.cpu_tokens[b]] = 0
             values[b, self.cpu_tokens[b]] = 0
         
-        print(f"the selected k cache:\n {keys}\n, v cache:\n {values}")
+        if debug_mode:
+            print(f"the cpu token {self.cpu_tokens}")
+        
+            print(f"the selected k cache:\n {keys[:, :, 0]}\n, v cache:\n {values[:, :, 0]}")
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
@@ -454,27 +464,31 @@ class SparseAttention(nn.Module):
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         
-        print(f"the corresponding scores:\n {scores}")
+        if debug_mode:
+            print(f"the corresponding scores:\n {scores[:, 0]}")
         
         n_selected_tokens = int((start_pos + seqlen) * (1 - self.sparsity))
-        n_local_tokens    = n_selected_tokens // 2
-        n_global_tokens   = n_selected_tokens - n_local_tokens
+        n_global_tokens    = n_selected_tokens // 2
+        n_local_tokens   = n_selected_tokens - n_global_tokens
         
         # update the attention scores
         self.attention_score_cache[: bsz, : n_local_tokens, : start_pos + seqlen] = torch.cat(
-            (self.attention_score_cache[: bsz, : self.n_local_kv_token, : start_pos + seqlen], torch.sum(scores, dim=1)), dim=1 # reduce scores on multi-head attention
-        )[: bsz, : n_local_tokens, : start_pos + seqlen]
-        self.n_local_kv_token = n_local_tokens
-        self.n_global_kv_token = n_global_tokens
+            (self.attention_score_cache[: bsz, : self.n_local_kv_tokens, : start_pos + seqlen], torch.sum(scores, dim=1)), dim=1 # reduce scores on multi-head attention
+        )[: bsz, self.n_local_kv_tokens + seqlen - n_local_tokens :, : start_pos + seqlen]
+        self.n_local_kv_tokens = n_local_tokens
+        self.n_global_kv_tokens = n_global_tokens
         
-        print(f"the attention score cache:\n {self.attention_score_cache[: bsz, : n_local_tokens, : start_pos + seqlen]}")
+        if debug_mode:
+            print(f"the number of selected kv_token: {n_local_tokens}, {n_global_tokens}")
+            print(f"the attention score cache:\n {self.attention_score_cache[: bsz, : n_local_tokens, : start_pos + seqlen]}")
         
         # select the important tokens
         attention_sum = torch.sum(self.attention_score_cache[: bsz, : n_local_tokens, : start_pos + seqlen - n_local_tokens], dim=1) # reduce on sequence dimension
         
         self.cpu_tokens = torch.topk(attention_sum, start_pos + seqlen - n_selected_tokens, dim=-1, largest=False).indices.tolist()
         
-        print(f"the cpu tokens:\n {self.cpu_tokens}")
+        if debug_mode:
+            print(f"the cpu tokens:\n {self.cpu_tokens}")
         
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
@@ -586,7 +600,10 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        print(f"layer id: {self.layer_id}")
+        if self.layer_id == 0:
+            os.environ['DEBUG'] = 'true'
+        else:
+            os.environ['DEBUG'] = 'false'
         h = x + self.attention(
             self.attention_norm(x), start_pos, freqs_cis, mask
         )
