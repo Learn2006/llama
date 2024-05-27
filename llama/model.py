@@ -443,14 +443,15 @@ class SparseAttention(nn.Module):
             print(f"the original kv cache:\n {keys[:, :, 0]}\n, v cache:\n {values[:, :, 0]}")
         
         # mask the cpu tokens
-        for b in range(bsz):
-            keys[b, self.cpu_tokens[b]] = 0
-            values[b, self.cpu_tokens[b]] = 0
+        # TODO:another solution is directly mask scores
+        # kmask = torch.zeros_like(keys).cuda()
+        # for b in range(bsz):
+        #     kmask[b, self.cpu_tokens[b]] = -torch.inf
         
         if debug_mode:
             print(f"the cpu token {self.cpu_tokens}")
         
-            print(f"the selected k cache:\n {keys[:, :, 0]}\n, v cache:\n {values[:, :, 0]}")
+            # print(f"the selected k cache:\n {keys[:, :, 0]}\n, v cache:\n {values[:, :, 0]}")
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
@@ -458,14 +459,19 @@ class SparseAttention(nn.Module):
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        # kmask = kmask.transpose(1, 2)
         values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        
+        for b in range(bsz):
+            scores[b, :, :, self.cpu_tokens[b]] = -torch.inf
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         
         if debug_mode:
-            print(f"the corresponding scores:\n {scores[:, 0]}")
+            print(f"the corresponding scores of head[0]:\n {scores[:, 0]}")
+            print(f"the reduced scores:\n {torch.sum(scores, dim=1)}")
         
         n_selected_tokens = int((start_pos + seqlen) * (1 - self.sparsity))
         n_global_tokens    = n_selected_tokens // 2
@@ -483,11 +489,18 @@ class SparseAttention(nn.Module):
             print(f"the attention score cache:\n {self.attention_score_cache[: bsz, : n_local_tokens, : start_pos + seqlen]}")
         
         # select the important tokens
-        attention_sum = torch.sum(self.attention_score_cache[: bsz, : n_local_tokens, : start_pos + seqlen - n_local_tokens], dim=1) # reduce on sequence dimension
+        local_scores  = self.attention_score_cache[: bsz, : n_local_tokens, : start_pos + seqlen - n_local_tokens]
+        attention_sum = local_scores / torch.sum(local_scores, dim=-1, keepdim=True)
+        if debug_mode:
+            print(f"the local_scores is:\n {local_scores}")
+            print(f"the attention_sum is:\n {attention_sum}")
+        # attention_sum = torch.sum(self.attention_score_cache[: bsz, : n_local_tokens, : start_pos + seqlen - n_local_tokens], dim=1) # reduce on sequence dimension
+        attention_sum = torch.sum(attention_sum, dim=1)
         
         self.cpu_tokens = torch.topk(attention_sum, start_pos + seqlen - n_selected_tokens, dim=-1, largest=False).indices.tolist()
         
         if debug_mode:
+            print(f"the reduced attention sum is :\n {attention_sum}")
             print(f"the cpu tokens:\n {self.cpu_tokens}")
         
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
@@ -605,7 +618,7 @@ class TransformerBlock(nn.Module):
         else:
             os.environ['DEBUG'] = 'false'
         h = x + self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask
+            self.attention_norm(x), start_pos, freqs_cis, mask,
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
